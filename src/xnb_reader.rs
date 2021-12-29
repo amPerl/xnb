@@ -1,4 +1,4 @@
-use std::io::{Read, Seek};
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 
 use binrw::BinReaderExt;
 
@@ -9,25 +9,80 @@ use crate::{
 };
 
 /// A wrapping reader for xnb files
-pub struct XnbReader<R: Read + Seek> {
+pub struct XnbReader {
     /// Generic file header
     pub header: Header,
     /// Readers and shared resources
     pub content_header: ContentHeader,
-    reader: R,
+
+    content_reader: std::io::Cursor<Vec<u8>>,
 }
 
-impl<R: Read + Seek> XnbReader<R> {
+impl XnbReader {
+    fn read_lzx_chunk<R: Read + Seek>(reader: &mut R) -> XnbResult<Vec<u8>> {
+        let flags: u8 = reader
+            .read_le()
+            .map_err(crate::Error::DecompressBinrwReadFailed)?;
+
+        let _frame_size = if flags == 0xFF {
+            // Dynamic frame size, read it in
+            reader
+                .read_be::<u16>()
+                .map_err(crate::Error::DecompressBinrwReadFailed)?
+        } else {
+            // Fixed frame size, rewind reader by flags size
+            let _ = reader.seek(SeekFrom::Current(-1))?;
+            0x8000u16
+        };
+
+        let block_size = reader
+            .read_be::<u16>()
+            .map_err(crate::Error::DecompressBinrwReadFailed)?;
+
+        let mut buffer = vec![0u8; block_size as usize];
+        reader.read_exact(&mut buffer)?;
+
+        Ok(buffer)
+    }
+
     /// Parse XNB headers from a reader and return a wrapping reader
-    pub fn from_reader(mut reader: R) -> XnbResult<XnbReader<R>> {
+    pub fn from_reader<R: Read + Seek>(mut reader: R) -> XnbResult<XnbReader> {
         let header: Header = reader.read_le().map_err(crate::Error::HeaderParseFailed)?;
 
-        if header.flags.compressed() {
-            return Err(crate::Error::FeatureNotSupported("Compressed data".into()));
-        }
+        let content_buffer = if header.flags.compressed() {
+            let mut content_buffer =
+                Vec::with_capacity(header.decompressed_size.unwrap_or(0) as usize);
 
-        let content_header: ContentHeader =
-            reader.read_le().map_err(crate::Error::ReadersParseFailed)?;
+            if header.flags.compressed_lz4() {
+                return Err(crate::Error::FeatureNotSupported("LZ4 Compression".into()));
+            }
+
+            let mut lzxd = lzxd::Lzxd::new(lzxd::WindowSize::KB64);
+
+            loop {
+                if content_buffer.len() == content_buffer.capacity() {
+                    break;
+                }
+
+                let compressed_chunk = Self::read_lzx_chunk(&mut reader)?;
+                let decompressed_chunk = lzxd.decompress_next(&compressed_chunk)?;
+                content_buffer.write_all(decompressed_chunk)?;
+            }
+
+            content_buffer
+        } else {
+            let mut content_buffer = vec![0u8; header.file_size as usize - 10];
+
+            reader.read_exact(&mut content_buffer)?;
+
+            content_buffer
+        };
+
+        let mut content_reader = Cursor::new(content_buffer);
+
+        let content_header: ContentHeader = content_reader
+            .read_le()
+            .map_err(crate::Error::ReadersParseFailed)?;
 
         if !content_header.shared_resources.is_empty() {
             return Err(crate::Error::FeatureNotSupported("Shared resources".into()));
@@ -36,12 +91,12 @@ impl<R: Read + Seek> XnbReader<R> {
         Ok(Self {
             header,
             content_header,
-            reader,
+            content_reader,
         })
     }
 
     fn next_object_reader_desc(&mut self) -> XnbResult<ObjectReaderDesc> {
-        let type_id = self.reader.read_le().unwrap();
+        let type_id = self.content_reader.read_le().unwrap();
         if type_id == 0 {
             return Err(crate::Error::FeatureNotSupported("Null object".into()));
         }
@@ -61,7 +116,10 @@ impl<R: Read + Seek> XnbReader<R> {
         let object_desc = self.next_object_reader_desc()?;
         let reader_desc = OR::desc();
 
-        if object_desc != reader_desc {
+        let reader_name_matches = object_desc.reader == reader_desc.reader
+            || object_desc.reader.starts_with(&reader_desc.reader);
+
+        if !reader_name_matches || object_desc.version != reader_desc.version {
             return Err(crate::ObjectReaderError::TypeMismatch {
                 object_desc,
                 reader_desc,
@@ -69,6 +127,6 @@ impl<R: Read + Seek> XnbReader<R> {
             .into());
         }
 
-        Ok(OR::read(&mut self.reader)?)
+        Ok(OR::read(&mut self.content_reader)?)
     }
 }

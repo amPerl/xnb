@@ -75,29 +75,32 @@ pub enum FormatVersion {
 
 /// Flags describing whether the content is Reach/HiDef and/or compressed
 #[derive(BinRead, Debug, PartialEq)]
-#[repr(u8)]
-pub enum Flags {
-    /// Uncompressed (0x80 is 0), Reach (0x01 is 0)
-    #[br(magic = 0x00u8)]
-    UncompressedReach,
-    /// Compressed (0x80 is 1), Reach (0x01 is 0)
-    #[br(magic = 0x80u8)]
-    CompressedReach,
-    /// Uncompressed (0x80 is 0), HiDef (0x01 is 1)
-    #[br(magic = 0x01u8)]
-    UncompressedHiDef,
-    /// Compressed (0x80 is 1), HiDef (0x01 is 1)
-    #[br(magic = 0x81u8)]
-    CompressedHiDef,
-}
+pub struct Flags(u8);
 
 impl Flags {
+    const HIDEF: u8 = 0x1;
+    const COMPRESSED_LZ4: u8 = 0x40;
+    const COMPRESSED_LZX: u8 = 0x80;
+    const COMPRESSED_ANY: u8 = Self::COMPRESSED_LZ4 | Self::COMPRESSED_LZX;
+
+    /// Returns whether or not the flags represent HiDef content
+    pub fn hidef(&self) -> bool {
+        self.0 & Self::HIDEF > 0
+    }
+
     /// Returns whether or not the flags represent compressed content
     pub fn compressed(&self) -> bool {
-        match self {
-            Flags::CompressedReach | Flags::CompressedHiDef => true,
-            Flags::UncompressedReach | Flags::UncompressedHiDef => false,
-        }
+        self.0 & Self::COMPRESSED_ANY > 0
+    }
+
+    /// Returns whether or not the compression type is LZ4
+    pub fn compressed_lz4(&self) -> bool {
+        self.0 & Self::COMPRESSED_LZ4 > 0
+    }
+
+    /// Returns whether or not the compression type is LZX
+    pub fn compressed_lzx(&self) -> bool {
+        self.0 & Self::COMPRESSED_LZX > 0
     }
 }
 
